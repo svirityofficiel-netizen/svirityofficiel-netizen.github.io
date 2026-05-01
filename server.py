@@ -1,73 +1,105 @@
-import threading
-import time
 import os
+import time
+import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 INPUT_FILE = os.path.join(BASE, "PROXY-Preparation-1.txt")
-OUTPUT_FILE = os.path.join(BASE, "PROXY-live-1.txt")
-TEST_URL = "http://httpbin.org/ip"
+TEST_URL = "http://clients3.google.com/generate_204"
 TIMEOUT = 5
-MAX_WORKERS = 50
-CHECK_INTERVAL = 60
+
+live_proxies = []
+ranked_proxies = []
 
 
 def check(proxy):
     try:
         if "://" not in proxy:
             proxy = "http://" + proxy
+        start = time.time()
         r = requests.get(TEST_URL, proxies={"http": proxy, "https": proxy}, timeout=TIMEOUT)
-        if r.status_code == 200:
-            return proxy
+        elapsed = round((time.time() - start) * 1000)
+        if r.status_code in (200, 204):
+            return proxy, elapsed
     except Exception:
         pass
-    return None
+    return None, None
 
 
-def run_checker():
-    if not os.path.exists(INPUT_FILE):
-        return
-    with open(INPUT_FILE, "r") as f:
-        proxies = [line.strip() for line in f if line.strip()]
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(check, p): p for p in proxies}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                results.append(result)
-    with open(OUTPUT_FILE, "w") as f:
-        f.write("\n".join(results))
+def get_country(ip):
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country,countryCode", timeout=3)
+        data = r.json()
+        return data.get("country", "Unknown"), data.get("countryCode", "??")
+    except Exception:
+        return "Unknown", "??"
 
 
-def scheduler():
+def checker_loop():
+    global live_proxies
     while True:
-        run_checker()
-        time.sleep(CHECK_INTERVAL)
+        if not os.path.exists(INPUT_FILE):
+            time.sleep(10)
+            continue
+
+        with open(INPUT_FILE, "r") as f:
+            proxies = [line.strip() for line in f if line.strip()]
+
+        results = []
+        for proxy in proxies:
+            proxy, elapsed = check(proxy)
+            if proxy:
+                results.append({"proxy": proxy, "ms": elapsed})
+            time.sleep(1)
+
+        live_proxies = results
 
 
-threading.Thread(target=scheduler, daemon=True).start()
+def ranker_loop():
+    global ranked_proxies
+    while True:
+        time.sleep(30)
+        if not live_proxies:
+            continue
+
+        enriched = []
+        for item in live_proxies:
+            proxy = item["proxy"]
+            ip = proxy.split("://")[-1].split(":")[0]
+            country, code = get_country(ip)
+            enriched.append({
+                "proxy": proxy,
+                "ms": item["ms"],
+                "country": country,
+                "country_code": code
+            })
+            time.sleep(1)
+
+        ranked_proxies = sorted(enriched, key=lambda x: x["ms"])
+
+
+threading.Thread(target=checker_loop, daemon=True).start()
+threading.Thread(target=ranker_loop, daemon=True).start()
 
 
 @app.route("/", methods=["GET"])
 def get_live():
-    if not os.path.exists(OUTPUT_FILE):
-        return jsonify({"count": 0, "proxies": []})
-    with open(OUTPUT_FILE, "r") as f:
-        proxies = [line.strip() for line in f if line.strip()]
+    proxies = [item["proxy"] for item in live_proxies]
     return jsonify({"count": len(proxies), "proxies": proxies})
 
 
 @app.route("/txt", methods=["GET"])
 def get_live_txt():
-    if not os.path.exists(OUTPUT_FILE):
-        return "", 200, {"Content-Type": "text/plain"}
-    with open(OUTPUT_FILE, "r") as f:
-        return f.read(), 200, {"Content-Type": "text/plain"}
+    proxies = "\n".join(item["proxy"] for item in live_proxies)
+    return proxies, 200, {"Content-Type": "text/plain"}
+
+
+@app.route("/ranked", methods=["GET"])
+def get_ranked():
+    return jsonify({"count": len(ranked_proxies), "proxies": ranked_proxies})
 
 
 if __name__ == "__main__":
